@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        window.addEventListener('click', (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const [header, base64Data] = href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style>
+
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Yamamoto Akira | AI, Full-Stack &amp; Web3 Developer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com/">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&amp;display=swap" rel="stylesheet">
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);
+--bg:#f4f6f8;--surface:#fff;--ink:#14213d;--muted:#5a6578;--line:#d9dee6;--accent:#2f4bff;--chip:#e8ecff}
+:root:not([data-theme="light"]){}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f1524;--surface:#172033;--ink:#eef1f7;--muted:#9aa6bd;--line:#2a3550;--accent:#7f95ff;--chip:#222d4b}}
+:root[data-theme="dark"]{--bg:#0f1524;--surface:#172033;--ink:#eef1f7;--muted:#9aa6bd;--line:#2a3550;--accent:#7f95ff;--chip:#222d4b}
+html{scroll-padding-top:env(safe-area-inset-top,0px);scroll-behavior:smooth}
+*,*::before,*::after{box-sizing:inherit}
+body{margin:0;background:var(--bg);color:var(--ink);font:400 1rem/1.65 "Bricolage Grotesque",system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:860px;margin:0 auto;padding:0 1.25rem 4rem}
+header{padding:4rem 0 2.5rem;border-bottom:1px solid var(--line)}
+.mono{width:72px;height:72px;border-radius:50%;background:var(--accent);color:#fff;display:grid;place-items:center;font-weight:800;font-size:1.6rem;margin-bottom:1.25rem}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .mono{color:#0f1524}}
+:root[data-theme="dark"] .mono{color:#0f1524}
+h1{font-size:clamp(2.4rem,7vw,4rem);line-height:1.05;font-weight:800;margin:0 0 .5rem;letter-spacing:-.02em}
+.role{font-size:1.2rem;color:var(--muted);margin:0}
+nav{display:flex;flex-wrap:wrap;gap:.5rem 1.25rem;margin-top:1.5rem}
+nav a{color:var(--accent);text-decoration:none;font-weight:600}
+nav a:hover,nav a:focus-visible{text-decoration:underline}
+a:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:3px}
+section{padding:2.75rem 0 0}
+h2{font-size:1.6rem;margin:0 0 1rem;letter-spacing:-.01em}
+p{max-width:68ch;margin:0 0 1rem}
+.skills{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:1rem}
+.box{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:1.1rem 1.25rem}
+.box h3{margin:0 0 .6rem;font-size:1.05rem}
+.chips{display:flex;flex-wrap:wrap;gap:.4rem;margin:0;padding:0;list-style:none}
+.chips li{background:var(--chip);border-radius:999px;padding:.15rem .7rem;font-size:.88rem}
+.job{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:1.5rem;margin-bottom:1.25rem}
+.job h3{margin:0;font-size:1.3rem}
+.meta{color:var(--muted);margin:.15rem 0 1rem}
+.job h4{margin:1.1rem 0 .4rem;font-size:.95rem;color:var(--muted);font-weight:600}
+.job ul.list{margin:0;padding-left:1.2rem}
+.job ul.list li{margin-bottom:.4rem}
+footer{margin-top:3rem;padding-top:1.5rem;border-top:1px solid var(--line);color:var(--muted)}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+<main>
+<header>
+  <div class="mono" aria-hidden="true">YA</div>
+  <h1>Yamamoto Akira</h1>
+  <p class="role">AI | Full-Stack | Machine Learning | Web3 Developer</p>
+  <nav aria-label="Sections"><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#about">About</a><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#skills">Skills</a><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#experience">Experience</a><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#education">Education</a></nav>
+</header>
+
+<section id="about">
+  <h2>About me</h2>
+  <p>I build production web applications, machine-learning systems, LLM and RAG applications, AI agents, and decentralized apps. My work spans React and Next.js frontends, Python and Node.js backends, deep learning models, and Ethereum smart contracts, shipped with Docker, AWS, and CI/CD.</p>
+</section>
+
+<section id="skills">
+  <h2>Skills</h2>
+  <div class="skills">
+    <div class="box"><h3>AI and machine learning</h3><ul class="chips"><li>OpenAI API</li><li>LLMs</li><li>RAG</li><li>Embeddings</li><li>PyTorch</li><li>TensorFlow</li><li>Scikit-learn</li><li>NLP</li><li>Computer Vision</li><li>Deep Learning</li><li>YOLO</li><li>Stable Diffusion</li></ul></div>
+    <div class="box"><h3>Frontend</h3><ul class="chips"><li>React</li><li>Next.js</li><li>Redux</li><li>Tailwind CSS</li><li>TypeScript</li><li>JavaScript</li><li>HTML</li><li>CSS</li></ul></div>
+    <div class="box"><h3>Backend</h3><ul class="chips"><li>Node.js</li><li>Express.js</li><li>FastAPI</li><li>Django</li><li>REST APIs</li><li>GraphQL</li><li>Python</li><li>Java</li></ul></div>
+    <div class="box"><h3>Web3</h3><ul class="chips"><li>Solidity</li><li>Ethereum</li><li>EVM</li><li>Smart Contracts</li><li>DeFi</li><li>NFTs</li><li>Staking</li><li>Ethers.js</li><li>MetaMask</li><li>WalletConnect</li><li>Hardhat</li><li>Foundry</li></ul></div>
+    <div class="box"><h3>Databases</h3><ul class="chips"><li>PostgreSQL</li><li>MySQL</li><li>MongoDB</li><li>ChromaDB</li><li>Vector Databases</li><li>SQL</li></ul></div>
+    <div class="box"><h3>Cloud, DevOps and tools</h3><ul class="chips"><li>AWS</li><li>Azure</li><li>Docker</li><li>Kubernetes</li><li>MLflow</li><li>GitHub Actions</li><li>CI/CD</li><li>Git</li><li>Postman</li><li>Linux</li></ul></div>
+  </div>
+</section>
+
+<section id="experience">
+  <h2>Experience</h2>
+
+  <article class="job">
+    <h3>Machine Learning / AI Engineer</h3>
+    <p class="meta">Agnost AI, San Francisco, CA | 2024 to present</p>
+    <h4>Stack</h4>
+    <ul class="chips"><li>PyTorch</li><li>YOLO</li><li>Stable Diffusion</li><li>FastAPI</li><li>Vector DBs</li><li>Docker</li><li>GitHub Actions</li><li>AWS</li></ul>
+    <h4>What I did</h4>
+    <ul class="list">
+      <li>Developed and fine-tuned CNN, Transformer, YOLO, and Stable Diffusion models for image and predictive AI applications.</li>
+      <li>Improved image-based disease prediction accuracy by about 20% through YOLO fine-tuning, hyperparameter optimization, feature selection, and error analysis.</li>
+      <li>Trained domain-specific models that analyze match dynamics and predict outcomes from in-game situations.</li>
+      <li>Built LLM applications with vector databases for semantic search across text and images.</li>
+      <li>Developed AI agents and FastAPI REST APIs that bring ML features into production web apps.</li>
+      <li>Containerized ML services with Docker, set up CI/CD with GitHub Actions, and deployed to AWS with engineering teams.</li>
+    </ul>
+  </article>
+
+  <article class="job">
+    <h3>Full-Stack Software Engineer</h3>
+    <p class="meta">Entangl, San Francisco, CA | 2023 to 2024</p>
+    <h4>Stack</h4>
+    <ul class="chips"><li>React</li><li>Next.js</li><li>TypeScript</li><li>Node.js</li><li>FastAPI</li><li>Django</li><li>OpenAI API</li><li>ChromaDB</li><li>Docker</li><li>AWS</li></ul>
+    <h4>What I did</h4>
+    <ul class="list">
+      <li>Built responsive, production-ready web apps with React, Next.js, TypeScript, and Node.js.</li>
+      <li>Designed backend services and REST APIs in Node.js, Python, FastAPI, and Django, covering authentication, data processing, and third-party integrations.</li>
+      <li>Created reusable frontend components and shared UI patterns used across multiple products.</li>
+      <li>Improved performance by optimizing database queries, API response times, caching, and frontend rendering.</li>
+      <li>Integrated the OpenAI API for content generation and semantic search, with ChromaDB for embeddings and retrieval.</li>
+      <li>Containerized applications with Docker and deployed production workloads on AWS.</li>
+    </ul>
+  </article>
+
+  <article class="job">
+    <h3>Web3 / Blockchain Developer</h3>
+    <p class="meta">Web3 Technology Company, Remote, USA | March 2018 to 2023</p>
+    <h4>Stack</h4>
+    <ul class="chips"><li>Solidity</li><li>TypeScript</li><li>React</li><li>Next.js</li><li>Ethers.js</li><li>Hardhat</li><li>Foundry</li><li>Node.js</li></ul>
+    <h4>What I did</h4>
+    <ul class="list">
+      <li>Built decentralized apps with Solidity, TypeScript, React, Next.js, and Ethers.js.</li>
+      <li>Designed, implemented, and tested smart contracts for token management, NFT minting, staking, and DeFi features.</li>
+      <li>Deployed contracts to Ethereum and EVM-compatible test networks.</li>
+      <li>Built Web3 interfaces with MetaMask and WalletConnect wallet connections.</li>
+      <li>Wrote automated contract tests with Hardhat and Foundry, and optimized Solidity to reduce gas costs.</li>
+      <li>Integrated blockchain indexing and RPC services, and connected on-chain data to Node.js backends.</li>
+      <li>Debugged failed transactions, contract errors, and wallet-connection issues; took part in code reviews and documentation.</li>
+    </ul>
+  </article>
+</section>
+
+<section id="education">
+  <h2>Education</h2>
+  <div class="box"><h3>California University of Pennsylvania</h3><p class="meta" style="margin:0">Bachelor's degree | 2011 to 2014</p></div>
+</section>
+
+<footer>Yamamoto Akira</footer>
+</main>
+
+
+</body></html>
